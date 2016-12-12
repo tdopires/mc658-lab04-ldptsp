@@ -11,10 +11,7 @@
 #include "gurobi_c++.h"
 #include <set>
 #include <lemon/unionfind.h>
-#include <lemon/gomory_hu.h>
-#include <lemon/tolerance.h>
 #include <lemon/hao_orlin.h>
-#include <lemon/adaptors.h>
 #include <iostream>
 #include <float.h>
 #include <lemon/list_graph.h>
@@ -22,88 +19,6 @@
 #include "lpdtspalgs.h"
 
 #define GUROBI_NEWVERSION 1
-
-//#define MY_EPS 0.01
-
-//------------------------------------------------------------------------------
-bool naive(const LpdTspInstance &instance, LpdTspSolution  &sol, int tl)
-/*
- * Algoritmo ingênuo para o LPD-TSP. Ideia:
- * constrNaiveHeur(l, s)
- *    s.tour.push_back(l.depot)
- *    while(s.tour.size() < 2*l.k+1)
- *       v = argmin_{v' in V} {d_{(v,v')} | (v' é adj a v) e ((v' é s) ou (v' é t de i cujo s é u em l.tour))}
- *       l.tour.push_back(v)
- */
-{
-    DNode v,
-         vl;
-
-    double vval,
-          vlval;
-
-    int i;
-
-    sol.tour.clear();
-    sol.cost = 0.0;
-
-    v = instance.depot;
-    sol.tour.push_back(v);
-
-    while((int)sol.tour.size() < 2 * instance.k + 1 && v != INVALID){
-        v    = INVALID;
-        vval = DBL_MAX;
-
-        for(OutArcIt o(instance.g, sol.tour.back()); o != INVALID; ++o){
-            vl    = instance.g.target(o);
-            vlval = DBL_MAX;
-
-            i = 0;
-            while(i < (int)sol.tour.size() && vl != sol.tour[i]) i++;
-            if(i < (int)sol.tour.size()) continue;
-
-            if(instance.s[vl] > 0){  // If DNode vl is start of an item
-                vlval = instance.weight[o];
-            }
-            else if(instance.t[vl] > 0){  // If DNode vl is término of an item
-                i = 0;
-                while(i < (int)sol.tour.size() && instance.t[ vl ] != instance.s[ sol.tour[i] ]){  // Look for the start DNode of the item which terminates in DNode vl
-                i++;
-                }
-                if(i < (int)sol.tour.size()){
-                    vlval = instance.weight[o];
-                }
-            }
-
-            if(vlval < vval){
-                v    = vl;
-                vval = vlval;
-            }
-        }
-
-        if(v != INVALID){
-            sol.tour.push_back(v);
-            sol.cost += vval;
-        }
-    }
-
-    if(v == INVALID){
-        sol.cost = DBL_MAX;
-    }
-    else{
-        OutArcIt o(instance.g, sol.tour.back());
-        for(; o != INVALID; ++o){
-            if(instance.g.target(o) == sol.tour.front()) break;
-        }
-        if(o != INVALID){
-            sol.cost += instance.weight[o];
-        }
-    }
-
-    return false;
-}
-//------------------------------------------------------------------------------
-
 
 bool contains_node(vector<DNode> &list, DNode node)
 {
@@ -253,22 +168,21 @@ bool constrHeur(const LpdTspInstance &l, LpdTspSolution  &s, int tl)
 bool metaHeur(const LpdTspInstance &l, LpdTspSolution  &s, int tl)
 /* Implemente esta função, entretanto, não altere sua assinatura */
 {
-    return naive(l, s, tl);
+    return constrHeur(l, s, tl);
 }
 
 class subtourelim: public GRBCallback
 {  
     const LpdTspInstance &l;
+    LpdTspSolution &s;
     Digraph::ArcMap<GRBVar> &y;
     double (GRBCallback::*solution_value)(GRBVar);
 public:
-    subtourelim(const LpdTspInstance &l, Digraph::ArcMap<GRBVar> &y) : l(l),y(y)  {    }
+    subtourelim(const LpdTspInstance &l, LpdTspSolution &s, Digraph::ArcMap<GRBVar> &y) : l(l), s(s), y(y)  {    }
 protected:
     void callback()
     { // --------------------------------------------------------------------------------
-        //cout << "subtourelim PART 1" << endl;
-
-    // get the correct function to obtain the values of the lp variables
+        // get the correct function to obtain the values of the lp variables
         if  (where==GRB_CB_MIPSOL) { // if this condition is true, all variables are integer
             solution_value = &subtourelim::getSolution;
         }
@@ -296,7 +210,7 @@ protected:
 
         try {
             // --------------------------------------------------------------------------------
-            // Use union-find to contract nodes (to obtain graph where each componente of g is contracted)
+            // Use union-find to contract nodes (to obtain graph where each component of g is contracted)
             //for (int i=0;i<l.n;i++) UFIndexToNode[i]=INVALID;
             DNodeIntMap aux_map(l.g);
             UnionFind<DNodeIntMap> UFNodes(aux_map);
@@ -333,7 +247,7 @@ protected:
             }
             // --------------------------------------------------------------------------------
 
-            if (CrossingEdges.size() > 0) {
+            if (CrossingEdges.size() > 0) { // there is subtour to eliminate
                 HaoOrlin<Digraph, ArcValueMap> min_cut(h,h_capacity);
                 min_cut.run();
 
@@ -343,7 +257,7 @@ protected:
                 //          1 -> 0       0 -> 1
                 GRBLinExpr exprOut = 0, exprIn = 0;
 
-                // Percorre as arestas que cruzam alguma componente e insere as que pertencem ao corte
+                // Search for arcs that are part of the cut
                 for (vector<Arc>::iterator a_it=CrossingEdges.begin();a_it!=CrossingEdges.end();++a_it){
                     DNode u=l.g.source(*a_it), v=l.g.target(*a_it),
                         hu = Index2h[UFNodes.find(u)], hv=Index2h[UFNodes.find(v)];
@@ -356,6 +270,32 @@ protected:
                 }
                 addLazy(exprOut >= 1);
                 addLazy(exprIn >= 1);
+
+            } else if (where==GRB_CB_MIPSOL) {
+
+                // Build solution tour and calculate cost
+                s.cost = 0.0;
+
+                DNode node = l.depot;
+                s.tour.clear();
+                s.tour.push_back(node);
+
+                while (s.tour.size() != l.n) {
+                    for (OutArcIt a(l.g, node); a!=INVALID; ++a) {
+                        if (BinaryIsOne((this->*solution_value)(y[a]))) {
+                            s.cost += l.weight[a];
+
+                            node = l.g.target(a);
+                            s.tour.push_back(node);
+                            break;
+                        }
+                    }
+                }
+
+                for (OutArcIt a(l.g, s.tour.back()); a!=INVALID; ++a) 
+                    if (l.g.target(a) == l.depot)
+                        s.cost += l.weight[a];
+            
             }
 
         } catch (...) {
@@ -386,11 +326,13 @@ bool exact(const LpdTspInstance &l, LpdTspSolution  &s, int tl)
         model.set(GRB_StringAttr_ModelName, "LPD-TSP"); // name to the problem
         model.set(GRB_IntAttr_ModelSense, GRB_MINIMIZE); // is a minimization problem
 
-        Digraph::ArcMap<GRBVar> y(l.g);
-        Digraph::ArcMap<GRBVar> d(l.g);
-        Digraph::ArcMap<vector<GRBVar>> f(l.g);
-        Digraph::NodeMap<GRBVar> x(l.g);
+        Digraph::ArcMap<GRBVar> y(l.g); // y[a] = if each arc is used in solution tour
+        Digraph::ArcMap<vector<GRBVar>> f(l.g); // f[a][k] = load of each item k in each arc a
+        Digraph::NodeMap<GRBVar> x(l.g); // x[v] = order of vertex v in solution tour {1,...,n}
 
+        for (DNodeIt v(l.g); v!=INVALID; ++v) {
+            x[v] = model.addVar(1, l.n, 1.0, GRB_INTEGER, "x_" + l.vname[v]);
+        }
         for (ArcIt a(l.g); a!=INVALID; ++a) {
             vector<GRBVar> f_k(l.k);
             for (int k = 0; k < l.k; k++) {
@@ -399,13 +341,8 @@ bool exact(const LpdTspInstance &l, LpdTspSolution  &s, int tl)
             f[a] = f_k;
 
             y[a] = model.addVar(0.0, 1.0, l.weight[a], GRB_BINARY, "y_" + l.vname[l.g.source(a)] + "-" + l.vname[l.g.target(a)]);
-            
-            d[a] = model.addVar(0.0, 1.0, 1.0, GRB_BINARY, "d_" + l.vname[l.g.source(a)] + "-" + l.vname[l.g.target(a)]);
         }
-        for (DNodeIt v(l.g); v!=INVALID; ++v) {
-            x[v] = model.addVar(1, l.n, 1.0, GRB_INTEGER, "x_" + l.vname[v]);
-        }
-        model.update(); // run update to use model inserted variables
+        model.update();
 
         GRBLinExpr exprObjective = 0;
         for (ArcIt a(l.g); a!=INVALID; ++a) {
@@ -414,8 +351,10 @@ bool exact(const LpdTspInstance &l, LpdTspSolution  &s, int tl)
         model.setObjective(exprObjective, GRB_MINIMIZE);
         model.update();
 
-        vector<bool> items_constr_added(l.k, false);
+        // Add restriction of depot in order 
         model.addConstr(x[l.depot] == 1); 
+
+        // Add restriction of order in each arc a=(u,v)
         for (ArcIt a(l.g); a!=INVALID; ++a) {
             if (l.g.target(a) == l.depot)
                 continue;
@@ -424,16 +363,11 @@ bool exact(const LpdTspInstance &l, LpdTspSolution  &s, int tl)
             DNode v = l.g.target(a);
 
             model.addConstr(x[v] - x[u] + 10*l.n*(1-y[a]) >= y[a]);
+        }
 
-            if (l.s[u] != 0 && !items_constr_added[ l.s[u]-1 ]) {
-                for (DNodeIt vv(l.g); vv!=INVALID; ++vv) {
-                    if (l.t[vv] == l.s[u]) {
-                        model.addConstr(x[u] <= x[vv] + 1);
-                        items_constr_added[ l.s[u]-1 ] = true;
-                        break;
-                    }
-                }
-            }
+        // Add restriction of order between source and target of each item
+        vector<bool> items_constr_added(l.k, false);
+        for (DNodeIt v(l.g); v!=INVALID; ++v) {
             if (l.s[v] != 0 && !items_constr_added[ l.s[v]-1 ]) {
                 for (DNodeIt vv(l.g); vv!=INVALID; ++vv) {
                     if (l.t[vv] == l.s[v]) {
@@ -458,6 +392,7 @@ bool exact(const LpdTspInstance &l, LpdTspSolution  &s, int tl)
             model.addConstr(exprIn == 1);
         }
 
+        // Add capacity constraint for each node
         for (DNodeIt v(l.g); v!=INVALID; ++v) {
             for (int k = 0; k < l.k; k++) {
                 GRBLinExpr exprOut = 0, exprIn = 0;
@@ -474,13 +409,11 @@ bool exact(const LpdTspInstance &l, LpdTspSolution  &s, int tl)
                 else if (l.t[v] == k+1) // is a delivery node of item k
                     demand = -( l.items[k].w );
 
-                if (demand == 0.0) // nothing about this item on this node
-                    continue;
-
                 model.addConstr(exprOut - exprIn == demand);
             }
         }
 
+        // Add general capacity constraints
         for (ArcIt a(l.g); a!=INVALID; ++a) {
             GRBLinExpr expr = 0;
             for (int k = 0; k < l.k; k++) {
@@ -493,26 +426,29 @@ bool exact(const LpdTspInstance &l, LpdTspSolution  &s, int tl)
             model.addConstr(expr <= l.capacity * y[a]);
         }
     
-        model.update(); // Process any pending model modifications.
+        model.update();
+
         if (tl >= 0) 
             model.getEnv().set(GRB_DoubleParam_TimeLimit, tl);
 
-        subtourelim cb = subtourelim(l, y);
+        subtourelim cb = subtourelim(l, s, y);
         model.setCallback(&cb);
         
-        naive(l, s, tl);
+        constrHeur(l, s, tl);
         if (s.cost < DBL_MAX) {
             model.getEnv().set(GRB_DoubleParam_Cutoff, s.cost + 0.1);
         }
 
-        model.update(); // Process any pending model modifications.
+        model.update();
         model.optimize();
 
         int status = model.get(GRB_IntAttr_Status);
         if (status == GRB_TIME_LIMIT) {
-            s.upperBound = model.get(GRB_DoubleAttr_ObjVal);
             s.lowerBound = model.get(GRB_DoubleAttr_ObjBound);
+            s.upperBound = model.get(GRB_DoubleAttr_ObjVal);
+
         } else if (status == GRB_OPTIMAL) {
+            // Build solution tour and calculate cost
             s.cost = 0.0;
 
             DNode node = l.depot;
